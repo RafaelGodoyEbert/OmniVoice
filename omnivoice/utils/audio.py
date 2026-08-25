@@ -224,7 +224,7 @@ def tensor_to_audiosegment(tensor, sample_rate):
 def fade_and_pad_audio(
     audio: torch.Tensor,
     pad_duration: float = 0.1,
-    fade_duration: float = 0.1,
+    fade_duration: float = 0.02,
     sample_rate: int = 24000,
 ) -> torch.Tensor:
     """

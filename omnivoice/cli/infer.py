@@ -112,6 +112,13 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_temperature", type=float, default=5.0)
     parser.add_argument("--class_temperature", type=float, default=0.0)
     parser.add_argument(
+        "--normalize_before_silence_removal",
+        type=str2bool,
+        default=False,
+        help=_("Peak-normalize audio before silence removal for better "
+        "detection and louder output."),
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -159,6 +166,7 @@ def main():
         t_shift=args.t_shift,
         denoise=args.denoise,
         postprocess_output=args.postprocess_output,
+        normalize_before_silence_removal=args.normalize_before_silence_removal,
         layer_penalty_factor=args.layer_penalty_factor,
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,

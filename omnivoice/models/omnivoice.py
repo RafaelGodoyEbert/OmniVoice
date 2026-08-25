@@ -98,6 +98,7 @@ class OmniVoiceGenerationConfig:
     denoise: bool = True
     preprocess_prompt: bool = True
     postprocess_output: bool = True
+    normalize_before_silence_removal: bool = False
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
 
@@ -250,9 +251,24 @@ class OmniVoice(PreTrainedModel):
 
                     resolved_path = snapshot_download(pretrained_model_name_or_path)
 
-                model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
-                )
+                try:
+                    model.text_tokenizer = AutoTokenizer.from_pretrained(
+                        pretrained_model_name_or_path
+                    )
+                except (OSError, Exception) as tok_err:
+                    # Network / rate-limit errors (e.g. HTTP 429) can cause
+                    # the tokenizer load to fail even when files are cached.
+                    # Fall back to offline mode before giving up.
+                    logger.warning(
+                        "Online tokenizer load failed (%s). "
+                        "Retrying with local_files_only=True ...",
+                        tok_err,
+                    )
+                    model.text_tokenizer = AutoTokenizer.from_pretrained(
+                        pretrained_model_name_or_path,
+                        local_files_only=True,
+                    )
+
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
@@ -629,10 +645,23 @@ class OmniVoice(PreTrainedModel):
             # Trim long reference audio (>20s) by splitting at the largest silence gap.
             # Skip trimming when ref_text is user-provided, otherwise the
             # trimmed audio will no longer match the full transcript.
+            input_duration = ref_wav.size(-1) / self.sampling_rate
             if ref_text is None:
-                ref_wav = trim_long_audio(
-                    ref_wav, self.sampling_rate, trim_threshold=20.0
+                ref_wav = trim_long_audio(ref_wav, self.sampling_rate)
+            elif input_duration > 30.0:
+                raise ValueError(
+                    f"Reference audio is too long ({input_duration:.1f}s). When providing "
+                    "reference text, the maximum allowed audio length is 30s to prevent "
+                    "GPU Out-Of-Memory errors."
                 )
+            elif input_duration > 20.0:
+                logger.warning(
+                    "Reference audio is %.1fs long (>20s) and ref_text was "
+                    "provided, so automatic trimming is skipped. A long reference "
+                    "may cause slower generation and degraded quality.",
+                    input_duration,
+                )
+
             ref_wav = remove_silence(
                 ref_wav,
                 self.sampling_rate,
@@ -645,15 +674,6 @@ class OmniVoice(PreTrainedModel):
                     "Reference audio is empty after silence removal. "
                     "Try setting preprocess_prompt=False."
                 )
-
-        ref_duration = ref_wav.size(-1) / self.sampling_rate
-        if ref_duration > 20.0:
-            logger.warning(
-                "Reference audio is %.1fs long (>20s). This may cause slower "
-                "generation, higher memory usage, and degraded voice cloning "
-                "quality. We recommend trimming it to 3-10s.",
-                ref_duration,
-            )
 
         # Auto-transcribe if ref_text not provided
         if ref_text is None:
@@ -716,6 +736,7 @@ class OmniVoice(PreTrainedModel):
             audio_waveform,
             postprocess_output=gen_config.postprocess_output,
             ref_rms=rms,
+            gen_config=gen_config,
         )
 
     def _post_process_audio(
@@ -723,6 +744,7 @@ class OmniVoice(PreTrainedModel):
         generated_audio: torch.Tensor,
         postprocess_output: bool,
         ref_rms: Union[float, None],
+        gen_config: OmniVoiceGenerationConfig,
     ) -> torch.Tensor:
         """Optionally remove long silences, adjust volume, and add edge padding.
 
@@ -733,13 +755,20 @@ class OmniVoice(PreTrainedModel):
         Returns:
             Processed audio tensor of shape (1, T).
         """
+        should_normalize = getattr(gen_config, "normalize_before_silence_removal", False)
+
         if postprocess_output:
+            if should_normalize:
+                peak = generated_audio.abs().max()
+                if peak > 1e-6:
+                    generated_audio = generated_audio / peak * 0.99
+
             generated_audio = remove_silence(
                 generated_audio,
                 self.sampling_rate,
                 mid_sil=500,
                 lead_sil=100,
-                trail_sil=100,
+                trail_sil=200,
             )
 
         if ref_rms is not None and ref_rms < 0.1:
@@ -751,10 +780,18 @@ class OmniVoice(PreTrainedModel):
             if peak > 1e-6:
                 generated_audio = generated_audio / peak * 0.5
 
-        generated_audio = fade_and_pad_audio(
-            generated_audio,
-            sample_rate=self.sampling_rate,
-        )
+        # Apply peak normalization AFTER volume adjustment so the gain
+        # is not undone by the ref_rms scaling above.
+        if should_normalize:
+            peak = generated_audio.abs().max()
+            if peak > 1e-6:
+                generated_audio = generated_audio / peak * 0.99
+
+        if postprocess_output:
+            generated_audio = fade_and_pad_audio(
+                generated_audio,
+                sample_rate=self.sampling_rate,
+            )
         return generated_audio
 
     def _generate_chunked(
@@ -809,6 +846,7 @@ class OmniVoice(PreTrainedModel):
                     ref_texts[j],
                     ref_audios[j].size(-1) if ref_audios[j] is not None else None,
                     speed=speed_list[i] if speed_list else 1.0,
+                    lang=task.langs[i],
                 )
                 for j, i in enumerate(indices)
             ]
@@ -972,6 +1010,7 @@ class OmniVoice(PreTrainedModel):
                 if ref_audio_tokens_list[i] is not None
                 else None,
                 speed=item_speed,
+                lang=language_list[i],
             )
             num_target_tokens_list.append(est)
 
@@ -1005,7 +1044,9 @@ class OmniVoice(PreTrainedModel):
             speed=speed_list,
         )
 
-    def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
+    def _estimate_target_tokens(
+        self, text, ref_text, num_ref_audio_tokens, speed=1.0, lang=None
+    ):
         """Estimate number of target audio tokens."""
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
             # Fall back to a simple heuristic
@@ -1015,6 +1056,10 @@ class OmniVoice(PreTrainedModel):
         est = self.duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens
         )
+        # Compensate for Portuguese syllable-timed cadence & unreduced vowels (especially cross-lingual)
+        if lang and str(lang).strip().lower() in ("pt", "por", "portuguese", "pt-br", "pt_br", "brazilian portuguese"):
+            est = est * 1.18
+
         if speed > 0 and speed != 1.0:
             est = est / speed
         return max(1, int(est))
@@ -1075,11 +1120,13 @@ class OmniVoice(PreTrainedModel):
         )  # [1, C, N1]
 
         # Build text tokens
-        full_text = _combine_text(ref_text=ref_text, text=text)
-        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
+        full_text = _combine_text(ref_text=ref_text, text=text, lang=lang)
         text_tokens = (
-            _tokenize_with_nonverbal_tags(wrapped_text, self.text_tokenizer)
-            .repeat(self.config.num_audio_codebook, 1)
+            self.text_tokenizer(
+                f"<|text_start|>{full_text}<|text_end|>",
+                return_tensors="pt",
+            )
+            .input_ids.repeat(self.config.num_audio_codebook, 1)
             .unsqueeze(0)
         ).to(
             self.device
@@ -1491,71 +1538,36 @@ def _get_time_steps(
     return timesteps
 
 
-_NONVERBAL_PATTERN = re.compile(
-    r"\[(laughter|sigh|confirmation-en|question-en|question-ah|question-oh|"
-    r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
-    r"surprise-yo|dissatisfaction-hnn)\]"
-)
-
-
-def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
-    """Tokenize text containing non-verbal tags, handling each tag independently.
-
-    Non-verbal tags are tokenized standalone to guarantee consistent token
-    IDs regardless of surrounding language context (Chinese, English, etc.).
-
-    Args:
-        text: Full text string potentially containing non-verbal tags.
-        tokenizer: HuggingFace text tokenizer instance.
-    Returns:
-        Token IDs tensor of shape (1, seq_len).
-    """
-    parts = []
-    last_end = 0
-    for m in _NONVERBAL_PATTERN.finditer(text):
-        if m.start() > last_end:
-            segment = text[last_end : m.start()]
-            ids = tokenizer(segment, add_special_tokens=False).input_ids
-            if ids:
-                parts.append(ids)
-        tag_ids = tokenizer(m.group(), add_special_tokens=False).input_ids
-        if tag_ids:
-            parts.append(tag_ids)
-        last_end = m.end()
-    if last_end < len(text):
-        segment = text[last_end:]
-        ids = tokenizer(segment, add_special_tokens=False).input_ids
-        if ids:
-            parts.append(ids)
-
-    if not parts:
-        result = tokenizer(text, return_tensors="pt").input_ids
-    else:
-        combined = []
-        for p in parts:
-            combined.extend(p)
-        result = torch.tensor([combined], dtype=torch.long)
-    return result
-
-
-def _combine_text(text, ref_text: Optional[str] = None) -> str:
+def _combine_text(text, ref_text: Optional[str] = None, lang: Optional[str] = None) -> str:
 
     # combine with reference text if not None
     if ref_text:
-        full_text = ref_text.strip() + " " + text.strip()
+        if lang and lang != "None":
+            full_text = ref_text.strip() + f" <|lang_start|>{lang}<|lang_end|>" + text.strip()
+        else:
+            full_text = ref_text.strip() + " " + text.strip()
     else:
         full_text = text.strip()
 
-    # filter out newline / carriage-return characters
-    full_text = re.sub(r"[\r\n]+", "", full_text)
-
-    # collapse consecutive spaces / tabs into a single space
-    full_text = re.sub(r"[ \t]+", " ", full_text)
+    # replace \n with . (only strip horizontal whitespace after the newline,
+    # so that blank lines between stanzas produce separate dots rather than
+    # being collapsed into a single one together with the next line).
+    full_text = re.sub(r"[ \t]*\r?\n[ \t]*", ".", full_text)
 
     # remove spaces around chinese characters
     chinese_range = r"[\u4e00-\u9fff]"
     pattern = rf"(?<={chinese_range})\s+|\s+(?={chinese_range})"
     full_text = re.sub(pattern, "", full_text)
+
+    # Remove whitespace immediately before special emotion tags (except
+    # [laughter]).  During training these tags have no preceding space, so
+    # the text tokenizer would mis-tokenise them if spaces were present.
+    _EMOTION_TAGS = (
+        r"sigh|confirmation-en|question-en|question-ah|question-oh|"
+        r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
+        r"surprise-yo|dissatisfaction-hnn"
+    )
+    full_text = re.sub(rf"\s+(\[({_EMOTION_TAGS})\])", r"\1", full_text)
 
     return full_text
 

@@ -174,6 +174,7 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
+        normalize_before_silence_removal,
         mode,
         ref_text=None,
     ):
@@ -186,6 +187,7 @@ def build_demo(
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
+            normalize_before_silence_removal=bool(normalize_before_silence_removal),
         )
 
         lang = language if (language and language != "Auto") else None
@@ -199,19 +201,19 @@ def build_demo(
         if duration is not None and float(duration) > 0:
             kw["duration"] = float(duration)
 
-        if mode == "clone":
-            if not ref_audio:
-                return None, "Please upload a reference audio."
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
-
-        if mode == "design":
-            if instruct and instruct.strip():
-                kw["instruct"] = instruct.strip()
-
         try:
+            if mode == "clone":
+                if not ref_audio:
+                    return None, _("Please upload a reference audio.")
+                kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
+
+            if mode == "design":
+                if instruct and instruct.strip():
+                    kw["instruct"] = instruct.strip()
+
             audio = model.generate(**kw)
         except Exception as e:
             return None, _("Error: {error_type}: {error_msg}").format(
@@ -302,7 +304,12 @@ def build_demo(
                 value=True,
                 info=_("Remove long silences from generated audio."),
             )
-        return ns, gs, dn, sp, du, pp, po
+            nsr = gr.Checkbox(
+                label=_("Normalize Before Silence Removal"),
+                value=False,
+                info=_("Applies max gain before removing silence to improve silence detection for quiet speech."),
+            )
+        return ns, gs, dn, sp, du, pp, po, nsr
 
     with gr.Blocks(theme=theme, css=css, title=_("OmniVoice Demo")) as demo:
         gr.Markdown(_("MD_DEMO_HEADER"))
@@ -346,6 +353,7 @@ def build_demo(
                             vc_du,
                             vc_pp,
                             vc_po,
+                            vc_nsr,
                         ) = _gen_settings()
                         vc_btn = gr.Button(_("Generate"), variant="primary")
                     with gr.Column(scale=1):
@@ -356,7 +364,7 @@ def build_demo(
                         vc_status = gr.Textbox(label=_("Status"), lines=2)
 
                 def _clone_fn(
-                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
+                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po, nsr
                 ):
                     return _gen(
                         text,
@@ -370,6 +378,7 @@ def build_demo(
                         du,
                         pp,
                         po,
+                        nsr,
                         mode="clone",
                         ref_text=ref_text or None,
                     )
@@ -389,6 +398,7 @@ def build_demo(
                         vc_du,
                         vc_pp,
                         vc_po,
+                        vc_nsr,
                     ],
                     outputs=[vc_audio, vc_status],
                 )
@@ -425,6 +435,7 @@ def build_demo(
                             vd_du,
                             vd_pp,
                             vd_po,
+                            vd_nsr,
                         ) = _gen_settings()
                         vd_btn = gr.Button(_("Generate"), variant="primary")
                     with gr.Column(scale=1):
@@ -446,7 +457,7 @@ def build_demo(
                         return None
                     return ", ".join(selected)
 
-                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, *groups):
+                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, nsr, *groups):
                     return _gen(
                         text,
                         lang,
@@ -459,6 +470,7 @@ def build_demo(
                         du,
                         pp,
                         po,
+                        nsr,
                         mode="design",
                     )
 
@@ -474,6 +486,7 @@ def build_demo(
                         vd_du,
                         vd_pp,
                         vd_po,
+                        vd_nsr,
                     ]
                     + vd_groups,
                     outputs=[vd_audio, vd_status],

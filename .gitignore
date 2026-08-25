@@ -28,3 +28,10 @@ examples/exp*/
 .claude/
 *.wav
 *.jsonl
+.hf_cache/
+hf_cache/
+.uv_cache/
+.uv_python/
+*.7z
+_omni_server_tmp.py
+diff*.txt
